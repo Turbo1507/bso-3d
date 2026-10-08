@@ -91,6 +91,27 @@ export function plinthTop(mesh, water) {
   return ng;
 }
 
+// прячет то, что торчит из-под основания: треугольники за контуром и боковые стенки тонких слоёв у края
+const insidePoly = (poly, x, z) => { let c = false; for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) { const [xi, zi] = poly[i], [xj, zj] = poly[j]; if ((zi > z) !== (zj > z) && x < (xj - xi) * (z - zi) / (zj - zi) + xi) c = !c; } return c; };
+const edgeDist = (poly, x, z) => { let m = 1e9; for (let i = 0; i < poly.length; i++) { const [ax, az] = poly[i], [bx, bz] = poly[(i + 1) % poly.length]; const ex = bx - ax, ez = bz - az, t = Math.max(0, Math.min(1, ((x - ax) * ex + (z - az) * ez) / (ex * ex + ez * ez || 1))); m = Math.min(m, Math.hypot(x - ax - ex * t, z - az - ez * t)); } return m; };
+export function trimToOutline(mesh, polys, band = 1.5, minY = -1e9) {
+  const g = mesh.geometry.index ? mesh.geometry.toNonIndexed() : mesh.geometry;
+  const p = g.attributes.position, out = [], w = [new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3()], n = new THREE.Vector3(), e = new THREE.Vector3();
+  for (let i = 0; i < p.count; i += 3) {
+    for (let j = 0; j < 3; j++) w[j].fromBufferAttribute(p, i + j).applyMatrix4(mesh.matrixWorld);
+    const x = (w[0].x + w[1].x + w[2].x) / 3, z = (w[0].z + w[1].z + w[2].z) / 3;
+    if (!polys.some(poly => insidePoly(poly, x, z))) continue;
+    if (Math.min(w[0].y, w[1].y, w[2].y) < minY) continue;
+    n.subVectors(w[1], w[0]).cross(e.subVectors(w[2], w[0])).normalize();
+    if (Math.abs(n.y) < 0.4 && Math.min(...polys.map(poly => edgeDist(poly, x, z))) < band) continue;
+    for (let j = 0; j < 3; j++) out.push(p.getX(i + j), p.getY(i + j), p.getZ(i + j));
+  }
+  const ng = new THREE.BufferGeometry();
+  ng.setAttribute('position', new THREE.Float32BufferAttribute(out, 3));
+  ng.computeVertexNormals();
+  return ng;
+}
+
 /* ---------- основание: кусок земли, вырванный по контуру участка ---------- */
 const hash = (x, y, z) => { const s = Math.sin(x * 127.1 + y * 311.7 + z * 74.7) * 43758.5453; return s - Math.floor(s); };
 function vnoise(x, y, z) {
@@ -167,8 +188,35 @@ function depthInside(poly, x, z, nx, nz) {
   return best;
 }
 
-export function buildEarthChunk(plinth, material, topY) {
-  let poly = outline(plinth);
+// контур верхних граней меша (вода): рёбра, которые принадлежат одному треугольнику
+export function footprint(mesh) {
+  const g = mesh.geometry.index ? mesh.geometry.toNonIndexed() : mesh.geometry;
+  const p = g.attributes.position, w = [new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3()], n = new THREE.Vector3(), e = new THREE.Vector3();
+  const key = (v) => `${Math.round(v.x * 20)},${Math.round(v.z * 20)}`, cnt = new Map(), pts = new Map();
+  for (let i = 0; i < p.count; i += 3) {
+    for (let j = 0; j < 3; j++) w[j].fromBufferAttribute(p, i + j).applyMatrix4(mesh.matrixWorld);
+    n.subVectors(w[1], w[0]).cross(e.subVectors(w[2], w[0]));
+    if (n.normalize().y < 0.5) continue;
+    for (let j = 0; j < 3; j++) {
+      const a = key(w[j]), b = key(w[(j + 1) % 3]); if (a === b) continue;
+      pts.set(a, [w[j].x, w[j].z]); pts.set(b, [w[(j + 1) % 3].x, w[(j + 1) % 3].z]);
+      const k = a < b ? a + '|' + b : b + '|' + a; cnt.set(k, (cnt.get(k) || 0) + 1);
+    }
+  }
+  const adj = new Map(), link = (a, b) => { if (!adj.has(a)) adj.set(a, new Set()); adj.get(a).add(b); };
+  for (const [k, c] of cnt) if (c === 1) { const [a, b] = k.split('|'); link(a, b); link(b, a); }
+  const seen = new Set(); let best = [];
+  for (const start of adj.keys()) {
+    if (seen.has(start)) continue;
+    const loop = [start]; seen.add(start); let prev = null, cur = start;
+    for (;;) { const next = [...adj.get(cur)].find(k => k !== prev && !seen.has(k)); if (!next) break; loop.push(next); seen.add(next); prev = cur; cur = next; }
+    if (loop.length > best.length) best = loop;
+  }
+  return best.map(k => pts.get(k));
+}
+
+export function buildEarthChunk(plinth, material, topY, given) {
+  let poly = given || outline(plinth);
   if (poly.length < 8) return null;
   poly = resample(poly, 1.5);
   let area = 0;
@@ -192,7 +240,12 @@ export function buildEarthChunk(plinth, material, topY) {
 
   const RINGS = 10, DEPTH = 5;
   // верх среза идёт по краю газона и дорожек; провалы (нет попадания) берём от соседей
-  let tops = poly.map(([x, z], i) => (topY ? topY(x + nrm[i][0] * 0.6, z + nrm[i][1] * 0.6) : null));
+  // верх среза поднимаем до самой высокой поверхности у края, чтобы из-под неё не торчали слои
+  let tops = poly.map(([x, z], i) => {
+    if (!topY) return null;
+    const h = [0.2, 0.6, 1.2].map(d => topY(x + nrm[i][0] * d, z + nrm[i][1] * d)).filter(v => v != null);
+    return h.length ? Math.max(...h) : null;
+  });
   tops = tops.map((t, i) => {
     const w = []; for (let j = -3; j <= 3; j++) { const v2 = tops[(i + j + N) % N]; if (v2 != null) w.push(v2); }
     return w.length ? w.sort((a, b) => a - b)[w.length >> 1] : CLIP_Y + 1;
@@ -202,7 +255,7 @@ export function buildEarthChunk(plinth, material, topY) {
   for (let k = 0; k <= RINGS; k++) {
     const f = k / RINGS;
     const ring = poly.map(([x, z], i) => {
-      const top = tops[i] - 0.05, bot = CLIP_Y - DEPTH;
+      const top = tops[i] + 0.02, bot = CLIP_Y - DEPTH;
       if (k === 0) return [x, top, z];
       const y = top - (top - bot) * Math.pow(f, 1.1) + (k === RINGS ? (fbm(x * 0.15, 9, z * 0.15) - 0.5) * 4 : 0);
       // объём: комья выпирают наружу и проваливаются внутрь, к низу край уходит под модель
@@ -229,6 +282,7 @@ export function buildEarthChunk(plinth, material, topY) {
   geo.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3));
   geo.computeVertexNormals();
   const group = new THREE.Group();
+  group.userData.outline = poly;
   const mesh = new THREE.Mesh(geo, material);
   mesh.receiveShadow = true;
   group.add(mesh);
@@ -241,7 +295,9 @@ export function buildEarthChunk(plinth, material, topY) {
     if (rnd() > 0.5) continue;
     const k = 1 + Math.floor(rnd() * (RINGS - 2));
     const [x, y, z] = rings[k][i];
-    rocks.push([x - nrm[i][0] * 0.2, y + (rnd() - 0.5) * 0.4, z - nrm[i][1] * 0.2, 0.3 + rnd() * 0.7]);
+    const ry = y + (rnd() - 0.5) * 0.4, rs = 0.3 + rnd() * 0.7;
+    if (ry + rs > tops[i] - 0.15) continue;
+    rocks.push([x - nrm[i][0] * 0.2, ry, z - nrm[i][1] * 0.2, rs]);
   }
   const rockI = new THREE.InstancedMesh(rockG, rockM, rocks.length);
   const m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), e = new THREE.Euler(), v = new THREE.Vector3(), sc = new THREE.Vector3();

@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { HL, maquette, buildEarthChunk, plinthTop } from './maquette.js?v=20261008g';
+import { HL, maquette, buildEarthChunk, plinthTop, trimToOutline, footprint } from './maquette.js?v=20261008h';
 
 const q = new URLSearchParams(location.search);
 const MODEL = q.get('model') || './model.glb';
@@ -158,7 +158,12 @@ function setupModel(root) {
   root.updateMatrixWorld(true);
   root.traverse(o => { if (o.isMesh && o.userData.mat === 'Material28') { const ch = buildEarthChunk(o, MAT.earth, topAt); if (ch) scene.add(ch);
     let water; root.traverse(w => { if (w.userData.mat === 'Material14') water = w; });
-    const top = new THREE.Mesh(plinthTop(o, water), MAT.ground); top.receiveShadow = true;
+    const top = new THREE.Mesh(plinthTop(o, water), MAT.earth); top.receiveShadow = true;
+    const polys = ch ? [ch.userData.outline] : [];
+    if (water) { const wch = buildEarthChunk(null, MAT.earth, topAt, footprint(water)); if (wch) { scene.add(wch); polys.push(wch.userData.outline); } }
+    // у воды оставляем только поверхность: нижняя грань плиты выглядывала из-под среза
+    const wTop = water ? new THREE.Box3().setFromObject(water).max.y - 0.5 : -1e9;
+    if (polys.length) groundMeshes.forEach(m => { if (m !== o) m.geometry = trimToOutline(m, polys, 1.5, m === water ? wTop : -1e9); });
     o.visible = false; groundMeshes = groundMeshes.filter(m => m !== o); scene.add(top); groundMeshes.push(top); } });
   const R = Math.max(s.x, s.z);
   sun.position.set(-R * 0.45, R * 0.55, -R * 0.2);
