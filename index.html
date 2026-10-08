@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>BSO 3D</title>
+<link rel="stylesheet" href="style.css?v=20261008g">
+<script type="importmap">
+{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"}}
+</script>
+<script src="js/units-data.js"></script>
+</head>
+<body>
+<div class="m3d" id="m3d">
+  <canvas class="m3d-canvas" id="m3dCanvas"></canvas>
+  <div class="m3d-pins" id="m3dPins"></div>
+
+  <div class="m3d-top">
+    <div class="m3d-chips" id="m3dTypes" role="group"></div>
+    <button class="m3d-chip m3d-avail" id="m3dAvail" type="button" aria-pressed="false"></button>
+    <div class="m3d-lang" role="group">
+      <button type="button" data-lang="ru">RU</button><span>/</span><button type="button" data-lang="en">EN</button>
+    </div>
+  </div>
+
+  <div class="m3d-bottom">
+    <div class="m3d-legend" id="m3dLegend"></div>
+    <button class="m3d-reset" id="m3dReset" type="button"></button>
+  </div>
+
+  <aside class="m3d-card" id="m3dCard" aria-hidden="true">
+    <button class="m3d-close" id="m3dClose" type="button"></button>
+    <div class="m3d-card-body" id="m3dCardBody"></div>
+  </aside>
+
+  <div class="m3d-loader" id="m3dLoader"><span></span></div>
+</div>
+<script type="module" src="app.js?v=20261008g"></script>
+</body>
+</html>
