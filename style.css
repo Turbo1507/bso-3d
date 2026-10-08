@@ -118,6 +118,9 @@ button{font:inherit;color:inherit;cursor:pointer}
 .m3d-loader span{width:160px;height:2px;background:var(--line);overflow:hidden;position:relative}
 .m3d-loader span::after{content:'';position:absolute;inset:0;background:var(--clay);transform-origin:left;transform:scaleX(var(--p,0));transition:transform .2s}
 .m3d-loader.is-done{opacity:0}
+.m3d-loader.is-error{pointer-events:auto;align-content:center;gap:16px;padding:16px;text-align:center}
+.m3d-loader.is-error p{max-width:360px;margin:0;color:var(--muted);font-size:16px;line-height:1.5}
+.m3d-loader.is-error .m3d-reset{position:static;justify-self:center}
 
 @media (max-width:760px){
   .m3d-top{left:8px;right:8px;top:8px}

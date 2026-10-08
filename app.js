@@ -1,7 +1,12 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
+import { computeBoundsTree, acceleratedRaycast } from 'three-mesh-bvh';
+// лучи по слитой сцене (сотни тысяч треугольников) идут через BVH, иначе метки и выбор виллы тормозят
+THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;
+THREE.Mesh.prototype.raycast = acceleratedRaycast;
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { HL, maquette, buildEarthChunk, plinthTop, trimToOutline, footprint } from './maquette.js?v=20261008h';
+import { HL, maquette, buildEarthChunk, plinthTop, trimToOutline, footprint } from './maquette.js?v=20261008i';
 
 const q = new URLSearchParams(location.search);
 const MODEL = q.get('model') || './model.glb';
@@ -19,6 +24,7 @@ const T = {
     plan: 'Смотреть планировку', studioTitle: 'Студии и пентхаусы',
     studioLead: 'Корпус у входа в комплекс, 4 этажа', floor: f => f === 4 ? 'Пентхаусы, 4 этаж' : `${f} этаж`,
     back: 'Ко всем студиям', close: 'Закрыть',
+    noGL: 'Браузер не поддерживает 3D. Откройте страницу в Chrome, Safari или Firefox последней версии.', loadErr: 'Не удалось загрузить модель.', retry: 'Повторить',
   },
   en: {
     all: 'All villas', avail: 'Available only', reset: 'Full view',
@@ -30,9 +36,11 @@ const T = {
     plan: 'View floor plan', studioTitle: 'Studios and penthouses',
     studioLead: 'Building at the entrance, 4 floors', floor: f => f === 4 ? 'Penthouses, 4th floor' : ['', '1st floor', '2nd floor', '3rd floor'][f],
     back: 'All studios', close: 'Close',
+    noGL: 'This browser does not support 3D. Open the page in an up-to-date Chrome, Safari or Firefox.', loadErr: 'The model failed to load.', retry: 'Try again',
   },
 };
-let lang = (q.get('lang') || localStorage.getItem('bso_lang') || 'ru') === 'en' ? 'en' : 'ru';
+const stored = (() => { try { return localStorage.getItem('bso_lang'); } catch (e) { return null; } })();
+let lang = (q.get('lang') || stored || 'ru') === 'en' ? 'en' : 'ru';
 
 /* ---------- данные ---------- */
 const STATUS = s => (s === 'presale' ? 'early' : s);
@@ -74,8 +82,21 @@ const fmtArea = s => String(s).replace('.', lang === 'ru' ? ',' : '.') + ' ' + 
 /* ---------- сцена ---------- */
 const canvas = document.getElementById('m3dCanvas');
 const wrap = document.getElementById('m3d');
-const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
-renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+// телефоны: плотность пикселей и тени скромнее, иначе греется и садит батарею
+const coarse = matchMedia('(pointer: coarse)').matches;
+function fail(text, retry) {
+  const box = document.getElementById('m3dLoader');
+  box.classList.remove('is-done'); box.classList.add('is-error');
+  box.innerHTML = `<p>${text}</p>` + (retry ? `<button type="button" class="m3d-reset">${T[lang].retry}</button>` : '');
+  if (retry) box.querySelector('button').onclick = () => location.reload();
+}
+let renderer;
+try { renderer = new THREE.WebGLRenderer({ canvas, antialias: !coarse, alpha: true, powerPreference: 'high-performance' }); }
+catch (e) { fail(T[lang].noGL); throw e; }
+renderer.setPixelRatio(Math.min(devicePixelRatio, coarse ? 1.5 : 2));
+// потеря контекста (свернули вкладку на телефоне, драйвер сбросил GPU): three восстановит сам, просим только перерисовать
+canvas.addEventListener('webglcontextlost', e => e.preventDefault());
+canvas.addEventListener('webglcontextrestored', () => invalidate());
 renderer.shadowMap.enabled = true;
 renderer.localClippingEnabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
@@ -96,7 +117,7 @@ controls.screenSpacePanning = false;
 scene.add(new THREE.HemisphereLight('#fffdf8', '#5b5750', 1.5));
 const sun = new THREE.DirectionalLight('#fff3df', 2.6);
 sun.castShadow = true;
-sun.shadow.mapSize.set(4096, 4096);
+sun.shadow.mapSize.set(coarse ? 2048 : 4096, coarse ? 2048 : 4096);
 sun.shadow.bias = -0.0003;
 sun.shadow.normalBias = 0.05;
 scene.add(sun, sun.target);
@@ -110,7 +131,28 @@ const MAT = {
   water: maquette('#ffffff', { tex: 'water', roughness: 0.3, metalness: 0.05, side: THREE.DoubleSide }),
   soil: maquette('#ffffff', { tex: 'soil', roughness: 1, flatShading: true, side: THREE.DoubleSide }),
   earth: maquette('#ffffff', { tex: 'soil', roughness: 1, flatShading: true, clip: false, side: THREE.DoubleSide }),
+  trunk: new THREE.MeshStandardMaterial({ name: 'trunk', color: '#d8d2c6', roughness: 1 }),
+  palmleaf: new THREE.MeshStandardMaterial({ name: 'palmleaf', color: '#8f9c74', roughness: 0.95, side: THREE.DoubleSide }),
+  rock: new THREE.MeshStandardMaterial({ name: 'rock', color: '#474747', roughness: 1, flatShading: true }),
+  vine: new THREE.MeshStandardMaterial({ name: 'vine', vertexColors: true, roughness: 0.9, side: THREE.DoubleSide }),
 };
+// у запечённых плоских слоёв нет нормалей в файле: тот же материал, но нормаль из производных
+const flatCache = new Map();
+function flat(m) {
+  if (m.flatShading) return m;
+  if (!flatCache.has(m)) {
+    const f = m.clone(); f.flatShading = true;
+    // без нормали смещение тени по нормали превращается в NaN и тень пропадает: смещаем только обычным bias
+    f.onBeforeCompile = (sh, r) => {
+      if (m.onBeforeCompile) m.onBeforeCompile(sh, r);
+      sh.vertexShader = sh.vertexShader.replace('#include <shadowmap_vertex>', THREE.ShaderChunk.shadowmap_vertex.replace('inverseTransformDirection( transformedNormal, viewMatrix )', 'vec3( 0.0 )'));
+    };
+    f.customProgramCacheKey = () => (m.customProgramCacheKey ? m.customProgramCacheKey() : '') + 'flat';
+    flatCache.set(m, f);
+  }
+  return flatCache.get(m);
+}
+const SHADOW = new Set(['build', 'glass', 'trunk', 'palmleaf']);
 // роли материалов SketchUp-выгрузки (см. разбор: цвета модели = типы вилл)
 const ROLE = {
   Material8: 'green', Material14: 'water', Material28: 'soil',
@@ -118,28 +160,63 @@ const ROLE = {
   Material22: 'glass', Material39: 'hide',
 };
 
-let modelRoot, buildMeshes = [], groundMeshes = [];
+let modelRoot, buildMeshes = [], groundMeshes = [], pinY = null, homeBox = null;
+const modelBox = () => homeBox ? new THREE.Box3(new THREE.Vector3().fromArray(homeBox), new THREE.Vector3().fromArray(homeBox, 3)) : new THREE.Box3().setFromObject(modelRoot);
 let units3d, unitList = [], fitDist = 300;
 const pinsEl = document.getElementById('m3dPins');
 
 const loader = document.getElementById('m3dLoader');
+const perf = { t0: 0 };
+/* грузим модель, когда блок подходит к экрану: на сайте он ниже первого экрана и не должен мешать загрузке страницы */
+function start() {
+perf.t0 = performance.now();
 Promise.all([
   fetch('data/units-3d.json').then(r => r.json()),
-  new Promise((res, rej) => new GLTFLoader().load(MODEL, res,
+  new Promise((res, rej) => new GLTFLoader().setMeshoptDecoder(MeshoptDecoder).load(MODEL, res,
     e => e.total && loader.style.setProperty('--p', (e.loaded / e.total).toFixed(3)), rej)),
 ]).then(([u3d, gltf]) => {
+  perf.load = performance.now() - perf.t0;
   units3d = u3d;
+  const ts = performance.now();
   setupModel(gltf.scene);
-  setupUnits();
-  buildUI();
-  resize();
+  perf.setup = performance.now() - ts;
+  let tq = performance.now();
+  setupUnits(); perf.units = performance.now() - tq; tq = performance.now();
+  buildUI(); perf.ui = performance.now() - tq; tq = performance.now();
+  resize(); perf.resize = performance.now() - tq;
   loader.classList.add('is-done');
   window.__ready = { units: unitList.length };
-  window.__m3d = { THREE, camera, controls, unitList, modelRoot };
-});
+  window.__m3d = { THREE, camera, controls, unitList, modelRoot, renderer, scene, perf, MAT, bakedR: lastR };
+  perf.ready = performance.now() - perf.t0;
+}).catch((e) => { console.error(e); fail(T[lang].loadErr, true); });
+}
+if ('IntersectionObserver' in window) {
+  const io = new IntersectionObserver(([e]) => { if (e.isIntersecting) { io.disconnect(); start(); } }, { rootMargin: '600px 0px' });
+  io.observe(wrap);
+} else start();
 
 function setupModel(root) {
   modelRoot = root;
+  // запечённая сцена (bake.js): земля, срезы, пальмы и лианы уже в файле, роль меша в extras
+  let baked = null; root.traverse(o => { if (o.userData.bakedR) { baked = o.userData.bakedR; pinY = o.userData.pinY || null; homeBox = o.userData.homeBox || null; } });
+  if (baked) {
+    root.traverse((o) => {
+      if (!o.isMesh) return;
+      const role = o.userData.role;
+      o.material = o.geometry.attributes.normal ? MAT[role] : flat(MAT[role]);
+      o.castShadow = SHADOW.has(role); o.receiveShadow = true;
+      if (role === 'build' || role === 'glass') buildMeshes.push(o);
+      else if (role !== 'trunk' && role !== 'palmleaf' && role !== 'rock' && role !== 'vine') groundMeshes.push(o);
+    });
+    scene.add(root);
+    root.updateMatrixWorld(true);
+    // индекс для выбора виллы мышью строим после первого кадра, чтобы не держать загрузку
+    const idle = window.requestIdleCallback || (f => setTimeout(f, 300));
+    idle(() => { const tb = performance.now(); buildMeshes.forEach(m => m.geometry.computeBoundsTree()); perf.bvh = performance.now() - tb; });
+    sun.shadow.bias = -0.0006;
+    setupLight(baked);
+    return;
+  }
   root.traverse((o) => {
     if (!o.isMesh) return;
     o.userData.mat = o.material.name;
@@ -166,11 +243,17 @@ function setupModel(root) {
     if (polys.length) groundMeshes.forEach(m => { if (m !== o) m.geometry = trimToOutline(m, polys, 1.5, m === water ? wTop : -1e9); });
     o.visible = false; groundMeshes = groundMeshes.filter(m => m !== o); scene.add(top); groundMeshes.push(top); } });
   const R = Math.max(s.x, s.z);
+  setupLight(R);
+  addPalms(R);
+}
+
+let lastR = 0;
+function setupLight(R) {
+  lastR = R;
   sun.position.set(-R * 0.45, R * 0.55, -R * 0.2);
   const sc = sun.shadow.camera;
   sc.left = sc.bottom = -R * 0.62; sc.right = sc.top = R * 0.62; sc.near = 1; sc.far = R * 2.5; sc.updateProjectionMatrix();
   fitDist = R * 1.25;
-  addPalms(R);
 }
 
 // высота земли у края: лиана начинается там, где кончается газон или дорожка
@@ -218,8 +301,7 @@ function addPalms() {
     for (let i = 0; i < p.count; i++) { const y = p.getY(i); p.setZ(i, -0.08 * y * y); p.setX(i, p.getX(i) * (1 - y / 3.6)); }
     leafG.rotateX(-Math.PI / 2 + 0.55); leafG.computeVertexNormals();
   }
-  const trunkM = new THREE.MeshStandardMaterial({ color: '#d8d2c6', roughness: 1 });
-  const leafM = new THREE.MeshStandardMaterial({ color: '#8f9c74', roughness: 0.95, side: THREE.DoubleSide });
+  const trunkM = MAT.trunk, leafM = MAT.palmleaf;
   const LEAVES = 9;
   const trunks = new THREE.InstancedMesh(trunkG, trunkM, pts.length);
   const leaves = new THREE.InstancedMesh(leafG, leafM, pts.length * LEAVES);
@@ -241,6 +323,7 @@ function addPalms() {
 
 /* ---------- юниты ---------- */
 const ray = new THREE.Raycaster();
+ray.firstHitOnly = true;
 function setupUnits() {
   const ang = THREE.MathUtils.degToRad(units3d.angleDeg);
   HL.uAxis.value.set(Math.cos(ang), Math.sin(ang));
@@ -249,10 +332,13 @@ function setupUnits() {
     const group = n === 'STUDIO';
     const u = group ? null : UNITS[n];
     if (!group && !u) continue;
-    // высота метки: верх здания под точкой
-    ray.set(new THREE.Vector3(x, 300, z), new THREE.Vector3(0, -1, 0));
-    const hit = ray.intersectObjects(buildMeshes, false)[0] || ray.intersectObjects(groundMeshes, false)[0];
-    const y = (hit ? hit.point.y : 0) + 1.2;
+    // высота метки: верх здания под точкой (в запечённой сцене уже посчитана)
+    let y = pinY && pinY[n];
+    if (y == null) {
+      ray.set(new THREE.Vector3(x, 300, z), new THREE.Vector3(0, -1, 0));
+      const hit = ray.intersectObjects(buildMeshes, false)[0] || ray.intersectObjects(groundMeshes, false)[0];
+      y = (hit ? hit.point.y : 0) + 1.2;
+    }
     const k = group ? 'studio' : typeKey(u.t);
     // подсветка по площади виллы: 1BD ~71 м², крупные форматы шире
     const big = group ? 1 : Math.min(1.5, Math.max(1, Math.sqrt(parseFloat(u.s) / 71.3)));
@@ -278,6 +364,7 @@ const passes = it => {
 const studioUnits = () => STUDIO_FLOORS.flatMap(([, ns]) => ns).map(n => UNITS[n]).filter(Boolean);
 
 function hover(it) {
+  invalidate();
   hovered = it;
   unitList.forEach(x => x.el.classList.toggle('is-hover', x === it));
   if (it && !it.group) { HL.uHov.value.set(it.pos.x, it.pos.z, 1, 0); HL.uHalfH.value.copy(it.half); }
@@ -285,6 +372,7 @@ function hover(it) {
   canvas.style.cursor = it ? 'pointer' : '';
 }
 function select(it, opts = {}) {
+  invalidate();
   selected = it;
   unitList.forEach(x => x.el.classList.toggle('is-sel', x === it));
   if (it && !it.group) { HL.uSel.value.set(it.pos.x, it.pos.z, 1, 0); HL.uHalf.value.copy(it.half); }
@@ -299,7 +387,7 @@ let fly = null, homePose = null;
    влезает в кадр с полями под панели (на телефоне длинная ось сама встаёт вертикально) */
 function fitHome() {
   const pts = unitList.map(it => it.pos.clone());
-  const box = new THREE.Box3().setFromObject(modelRoot);
+  const box = modelBox();
   for (const x of [box.min.x, box.max.x]) for (const z of [box.min.z, box.max.z]) pts.push(new THREE.Vector3(x, groundY(), z));
   const ctr = box.getCenter(new THREE.Vector3()); ctr.y = groundY();
   // реальный контур участка точнее углов габарита: точки юнитов + края, ужатые к центру
@@ -351,6 +439,7 @@ const groundY = () => gY ?? (gY = Math.min(...unitList.map(u => u.pos.y)) - 1.2)
 /* карточка закрывает часть экрана: сдвигаем центр проекции в свободную часть */
 let shift = { x: 0, y: 0 }, shiftTo = { x: 0, y: 0 };
 function updateShift() {
+  invalidate();
   const w = wrap.clientWidth, h = wrap.clientHeight, open = card.classList.contains('is-open');
   shiftTo = !open ? { x: 0, y: 0 } : w < 761 ? { x: 0, y: (card.offsetHeight - topBar.getBoundingClientRect().bottom) / 2 } : { x: (card.offsetWidth + 16) / 2, y: 0 };
 }
@@ -501,6 +590,7 @@ function closeCard() { cardState = null; card.classList.remove('is-open'); card.
 
 /* ---------- панели ---------- */
 function buildUI() {
+  invalidate();
   const t = T[lang];
   const types = document.getElementById('m3dTypes');
   types.innerHTML = [`<button class="m3d-chip" type="button" data-t="" aria-pressed="${!fType}">${t.all}</button>`]
@@ -536,13 +626,26 @@ function resize() {
 }
 addEventListener('resize', resize);
 const ease = x => 1 - Math.pow(1 - x, 3);
+/* рисуем только когда что-то меняется: камера, полёт, сдвиг под карточку, ввод, фильтры.
+   Блок вне экрана или вкладка скрыта — цикл стоит, сайт вокруг не тормозит */
+let dirty = 2, onScreen = true;
+const invalidate = () => { dirty = 2; };
+['pointerdown', 'pointermove', 'pointerup', 'wheel', 'click', 'keydown', 'touchstart'].forEach(t => wrap.addEventListener(t, invalidate, { passive: true }));
+controls.addEventListener('change', invalidate);
+if ('IntersectionObserver' in window) new IntersectionObserver(([e]) => { onScreen = e.isIntersecting; if (onScreen) invalidate(); }).observe(wrap);
 renderer.setAnimationLoop((now) => {
+  if (!onScreen) return;
+  let moving = false;
   if (fly) {
     const k = Math.min(1, (now - fly.s) / 900), e = ease(k);
     camera.position.lerpVectors(fly.p0, fly.p, e); controls.target.lerpVectors(fly.t0, fly.t, e);
     if (k === 1) fly = null;
+    moving = true;
   }
-  controls.update();
+  if (controls.update()) moving = true;
+  if (Math.abs(shiftTo.x - shift.x) > 0.3 || Math.abs(shiftTo.y - shift.y) > 0.3) moving = true;
+  if (!moving && !dirty) return;
+  if (dirty) dirty--;
   applyShift();
   renderer.render(scene, camera);
   if (unitList.length) layoutPins();

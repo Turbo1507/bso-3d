@@ -289,7 +289,7 @@ export function buildEarthChunk(plinth, material, topY, given) {
 
   // камни, вросшие в срез
   const rockG = new THREE.IcosahedronGeometry(1, 0);
-  const rockM = new THREE.MeshStandardMaterial({ color: '#474747', roughness: 1, flatShading: true });
+  const rockM = new THREE.MeshStandardMaterial({ name: 'rock', color: '#474747', roughness: 1, flatShading: true });
   const rocks = [];
   for (let i = 0; i < N; i += 2) {
     if (rnd() > 0.5) continue;
@@ -313,7 +313,7 @@ export function buildEarthChunk(plinth, material, topY, given) {
   const leafS = new THREE.Shape();
   leafS.moveTo(0, 0); leafS.quadraticCurveTo(0.26, -0.16, 0.02, -0.52); leafS.quadraticCurveTo(-0.24, -0.2, 0, 0);
   const leafG = new THREE.ShapeGeometry(leafS, 4);
-  const leafM = new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.9, side: THREE.DoubleSide });
+  const leafM = new THREE.MeshStandardMaterial({ name: 'vine', color: '#ffffff', roughness: 0.9, side: THREE.DoubleSide });
   const leaves = [];
   const bottom = CLIP_Y - DEPTH;
   for (let i = 0; i < N; i++) {
